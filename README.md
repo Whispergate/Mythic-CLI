@@ -1,5 +1,5 @@
 # Mythic-cli
-A CLI and TUI Tool to interact with the Mythic C2 Framework
+A CLI and TUI Tool to interact with the [Mythic C2 Framework](https://github.com/its-a-feature/Mythic).
 
 ## Disclaimer
 

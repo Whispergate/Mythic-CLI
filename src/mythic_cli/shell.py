@@ -494,12 +494,12 @@ Server: [yellow]{server}[/yellow]
         while self.running and self._monitoring:
             try:
                 poll_count += 1
-                if poll_count % 10 == 1:  # Log every 10 polls (every 30 seconds)
-                    console.print(f"[*] [MONITOR] Poll #{poll_count}")
+                # if poll_count % 10 == 1:  # Log every 10 polls (every 30 seconds)
+                #     console.print(f"[*] [MONITOR] Poll #{poll_count}")
                 self._update_callback_counts()
                 time.sleep(3)  # Update every 3 seconds
             except Exception as e:
-                console.print(f"[!] [MONITOR] Error in poll: {e}")
+                # console.print(f"[!] [MONITOR] Error in poll: {e}")
                 time.sleep(5)  # Back off on error
 
     def _update_callback_counts(self) -> None:
@@ -520,8 +520,8 @@ Server: [yellow]{server}[/yellow]
 
                 # Check for new callbacks
                 new_ids = current_ids - self._known_callback_ids
-                if new_ids:
-                    print(f"[!] [MONITOR] Found {len(new_ids)} new callback(s): {new_ids}")
+                # if new_ids:
+                #     console.print(f"[!] [MONITOR] Found {len(new_ids)} new callback(s): {new_ids}")
 
                 if new_ids:
                     # Get details about new callbacks
