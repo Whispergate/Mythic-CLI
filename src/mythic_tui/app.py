@@ -17,6 +17,7 @@ from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Input, ListItem, ListView, RichLog, Static
+from textual.suggester import Suggester
 from rich.markup import escape as rich_escape
 
 from mythic_cli.client import MythicAPIException, MythicClient
@@ -804,6 +805,35 @@ class FilesScreen(BaseScreen):
         self._append_log("[yellow]Unknown command[/yellow]. Use [white]help[/white].")
 
 
+class CallbackCommandSuggester(Suggester):
+    """Suggester for callback commands with agent-specific commands."""
+    
+    def __init__(self, commands: List[str]):
+        """Initialize with available commands.
+        
+        Args:
+            commands: List of available command names
+        """
+        super().__init__(case_sensitive=False)
+        self._commands = sorted(commands)
+    
+    async def get_suggestion(self, value: str) -> str | None:
+        """Get suggestion for the current input value."""
+        if not value:
+            return None
+        
+        value_lower = value.lower()
+        for command in self._commands:
+            if command.lower().startswith(value_lower) and command.lower() != value_lower:
+                return command
+        
+        return None
+    
+    def update_commands(self, commands: List[str]) -> None:
+        """Update the available commands list."""
+        self._commands = sorted(commands)
+
+
 class CallbackScreen(BaseScreen):
     BINDINGS = [
         Binding("escape", "back", "Back"),
@@ -818,6 +848,8 @@ class CallbackScreen(BaseScreen):
         self._tasks_table_ready = False
         self._commands_loaded = False
         self._displayed_task_ids: Set[int] = set()  # Track which tasks have had output displayed
+        self._command_suggester: Optional[CallbackCommandSuggester] = None
+        self._available_commands: List[str] = []
 
     def compose_main_content(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -911,6 +943,23 @@ class CallbackScreen(BaseScreen):
         if not commands:
             _safe_richlog_write(log, "[dim]No command metadata available[/dim]")
             return
+        
+        # Extract command names for suggester
+        agent_cmd_names = [str(cmd.get("cmd")) for cmd in commands if cmd.get("cmd")]
+        local_cmds = ["back", "quit", "cli_help", "?", "refresh", "commands", "tasks", "output", "task-output", "cls", "download-file", "upload-file"]
+        all_commands = agent_cmd_names + local_cmds
+        self._available_commands = all_commands
+        
+        # Update or create suggester
+        if self._command_suggester is None:
+            self._command_suggester = CallbackCommandSuggester(all_commands)
+            # Apply suggester to the input
+            input_widget = self.query_one("#cb-input", Input)
+            input_widget.suggester = self._command_suggester
+        else:
+            self._command_suggester.update_commands(all_commands)
+        
+        # Display commands in log
         for cmd in sorted(commands, key=lambda c: str(c.get("cmd", ""))):
             name = rich_escape(str(cmd.get("cmd", "")))
             help_cmd = rich_escape(str(cmd.get("help_cmd") or cmd.get("description") or ""))
@@ -1504,6 +1553,50 @@ class MythicTextualApp(App[None]):
                     "commandName": parts[1],
                     "remove": remove,
                 }
+            return raw
+        
+        # Generic forge command handler (forge_net_*, forge_coff_*, etc.)
+        # These commands typically expect arguments passed with flags or as a string
+        if command.startswith("forge_"):
+            # Try to parse as key-value pairs for flag-based arguments
+            parts = raw.split()
+            params = {}
+            positional_args = []
+            i = 0
+            while i < len(parts):
+                part = parts[i]
+                # Check if it's a flag (starts with -)
+                if part.startswith('-'):
+                    key = part.lstrip('-')  # Preserve exact case: -args -> args, -Arguments -> Arguments
+                    if i + 1 < len(parts) and not parts[i + 1].startswith('-'):
+                        value = parts[i + 1]
+                        # Try to convert to int if it looks like a number
+                        try:
+                            params[key] = int(value)
+                        except ValueError:
+                            # Check if it looks like a boolean
+                            if value.lower() in ('true', 'false'):
+                                params[key] = value.lower() == 'true'
+                            else:
+                                params[key] = value
+                        i += 2
+                    else:
+                        # Flag with no value
+                        params[key] = True
+                        i += 1
+                else:
+                    # Positional argument with no flag
+                    positional_args.append(part)
+                    i += 1
+            
+            # If we have positional args and no "args" key, put them in "args"
+            if positional_args and "args" not in params:
+                params["args"] = " ".join(positional_args)
+            
+            # If we parsed some parameters, return them
+            if params:
+                return params
+            # Otherwise return raw as parameters
             return raw
         if command in {"shell", "run", "execute"}:
             return {"command": raw}

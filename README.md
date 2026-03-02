@@ -32,11 +32,22 @@ pipx install git+https://github.com/Whispergate/Mythic-CLI.git
 ```
 
 ## Usage
-
+### Starting the programs
 ```bash
 mythic-cli # Starts the CLI interface
 mythic-tui # Starts the TUI interface
 ```
+
+### Registering Forge Commands
+
+```bash
+> forge_collections SharpCollection
+> forge_register SharpCollection <Command> (e.g. forge_register SharpCollection Rubeus)
+    > forge_net_Rubeus 
+> forge_download SharpCollection <Command> (e.g. forge_download SharpCollection Rubeus)
+```
+
+![Forge Collections Command Execution](assets/images/TUI-ForgeCollections.png)
 
 ## Contributing
 Contributions are welcome! Please fork the repository and submit a pull request with your changes. For major changes, please open an issue first to discuss what you would like to change.

@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.markup import escape as rich_escape
 
 from .client import MythicClient, MythicAPIException
 from .themes import get_supported_themes, get_syntax_theme, normalize_theme_name
@@ -193,6 +194,54 @@ class CommandHandler:
                     "remove": remove,
                 }
             return raw
+        
+        # Generic forge command handler (forge_net_*, forge_coff_*, etc.)
+        # These commands typically expect arguments passed with flags like -args, -Assembly, etc.
+        if command.startswith("forge_"):
+            # Try to parse as key-value pairs for flag-based arguments
+            try:
+                parts = shlex.split(raw)
+            except ValueError:
+                parts = raw.split()
+            
+            params = {}
+            positional_args = []
+            i = 0
+            while i < len(parts):
+                part = parts[i]
+                # Check if it's a flag (starts with -)
+                if part.startswith('-'):
+                    key = part.lstrip('-')  # Preserve exact case: -args -> args, -Arguments -> Arguments
+                    if i + 1 < len(parts) and not parts[i + 1].startswith('-'):
+                        value = parts[i + 1]
+                        # Try to convert to int if it looks like a number
+                        try:
+                            params[key] = int(value)
+                        except ValueError:
+                            # Check if it looks like a boolean
+                            if value.lower() in ('true', 'false'):
+                                params[key] = value.lower() == 'true'
+                            else:
+                                params[key] = value
+                        i += 2
+                    else:
+                        # Flag with no value
+                        params[key] = True
+                        i += 1
+                else:
+                    # Positional argument with no flag
+                    positional_args.append(part)
+                    i += 1
+            
+            # If we have positional args and no "args" key, put them in "args"
+            if positional_args and "args" not in params:
+                params["args"] = " ".join(positional_args)
+            
+            # If we parsed some parameters, return them
+            if params:
+                return params
+            # Otherwise return raw as arguments
+            return raw
 
         # Common commands that take a single text arg mapped to known Mythic arg names.
         if command in {"shell", "run", "execute"}:
@@ -319,13 +368,23 @@ class CommandHandler:
                 response_text = self._decode_response_text(response_text)
                 timestamp = output.get("timestamp", "")
                 if response_text:
-                    console.print(
-                        Panel(
-                            response_text,
-                            title=f"Task {task_id} Output at {timestamp}",
-                            border_style="green",
+                    try:
+                        console.print(
+                            Panel(
+                                response_text,
+                                title=f"Task {task_id} Output at {timestamp}",
+                                border_style="green",
+                            )
                         )
-                    )
+                    except Exception:
+                        # Fallback: escape markup if rendering fails
+                        console.print(
+                            Panel(
+                                rich_escape(response_text),
+                                title=f"Task {task_id} Output at {timestamp}",
+                                border_style="green",
+                            )
+                        )
 
             if task and task.get("completed"):
                 if not outputs:
@@ -1200,6 +1259,10 @@ Download a file from Mythic's repository to your local system.
 
     def interact_with_callback(self, callback_id: int) -> None:
         """Enter interactive mode with a specific callback."""
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import WordCompleter
+        from prompt_toolkit.history import InMemoryHistory
+        
         try:
             callback = self.client.get_callback(callback_id)
             if not callback:
@@ -1227,6 +1290,13 @@ Download a file from Mythic's repository to your local system.
                 if cmd.get("cmd")
             }
 
+            # Build completer with agent commands + local commands
+            agent_cmd_names = [str(cmd.get("cmd")) for cmd in (available_commands or []) if cmd.get("cmd")]
+            local_cmds = ["back", "cli_exit", "quit", "exit", "cls", "info", "cli_help", "help", "tasks", "output", "task-output"]
+            all_completions = agent_cmd_names + local_cmds
+            callback_completer = WordCompleter(all_completions, ignore_case=True, sentence=True)
+            callback_session = PromptSession(history=InMemoryHistory(), completer=callback_completer)
+
             user = callback.get('user', 'unknown')
             host = callback.get('host', 'unknown')
             payload = callback.get('payload', {})
@@ -1239,7 +1309,7 @@ Download a file from Mythic's repository to your local system.
 
             while True:
                 try:
-                    command_line = console.input(f"[yellow]callback-{display_callback_id}[/yellow] > ")
+                    command_line = callback_session.prompt(f"callback-{display_callback_id} > ")
 
                     if not command_line.strip():
                         continue
@@ -1550,13 +1620,23 @@ Download a file from Mythic's repository to your local system.
                 response_text = self._decode_response_text(response_text)
                 timestamp = output.get("timestamp", "")
 
-                console.print(
-                    Panel(
-                        response_text,
-                        title=f"Output at {timestamp}",
-                        border_style="green",
+                try:
+                    console.print(
+                        Panel(
+                            response_text,
+                            title=f"Output at {timestamp}",
+                            border_style="green",
+                        )
                     )
-                )
+                except Exception:
+                    # Fallback: escape markup if rendering fails
+                    console.print(
+                        Panel(
+                            rich_escape(response_text),
+                            title=f"Output at {timestamp}",
+                            border_style="green",
+                        )
+                    )
         except ValueError:
             console.print("[red]Invalid task ID[/red]")
         except MythicAPIException as e:

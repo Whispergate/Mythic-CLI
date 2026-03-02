@@ -5,6 +5,7 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markup import escape as rich_escape
 
 from .config import ConfigManager
 from .shell import MythicShell
@@ -290,7 +291,7 @@ def main():
         console.print("\n[yellow]Interrupted[/yellow]")
         sys.exit(0)
     except Exception as e:
-        console.print(f"[red]Fatal error:[/red] {str(e)}")
+        console.print(f"[red]Fatal error:[/red] {rich_escape(str(e))}")
         sys.exit(1)
 
 
