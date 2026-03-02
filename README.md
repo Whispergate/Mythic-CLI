@@ -28,7 +28,7 @@ Note: This project is in early development and may contain bugs or incomplete fe
 ## Installation
 
 ```bash
-pipx install git+https://github.com/Whisperlabs/Mythic-cli.git
+pipx install git+https://github.com/Whispergate/Mythic-CLI.git
 ```
 
 ## Usage

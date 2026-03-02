@@ -134,11 +134,33 @@ class CommandHandler:
         """Build Mythic task params from callback-shell style input.
 
         Supports JSON input when provided, plus common text-style command formats.
+        For commands that take no parameters, return None.
+        
+        Supports command augmentation from agents like forge (BOF/Assembly wrapper).
+        Forge commands are dynamically augmented to agents and appear in loadedcommands.
         """
         raw = (raw_args or "").strip()
+        
+        # Commands that take no parameters - return None immediately
+        # These will be sent without any params to the agent
+        no_param_commands = {
+            "ps", "status", "exit", "help", "whoami", "pwd", "getuid", "geteuid",
+            "getgid", "getegid", "uname", "id", "groups", "hostname", "ifconfig",
+            "ipconfig", "netstat", "arp", "route", "finger", "who", "w", "last",
+            "uptime", "date", "cal", "df", "du", "free", "top", "ps", "processes",
+            # Forge command augmenter management commands (when no args provided)
+            "forge_support", "forge_collections",
+        }
+        
+        if command in no_param_commands and not raw:
+            # These commands don't take any parameters
+            return None
+        
         if not raw:
+            # For commands that might take optional params
             if command == "ls":
-                return {"filepath": "."}
+                return {"path": "."}
+            # For other commands with no args, return None
             return None
 
         # If user supplied JSON, use it as-is.
@@ -146,6 +168,31 @@ class CommandHandler:
             return json.loads(raw)
         except json.JSONDecodeError:
             pass
+
+        # Forge command augmenter command mappings
+        if command == "forge_collections":
+            return {"collectionName": raw}
+        if command == "forge_download":
+            try:
+                parts = shlex.split(raw)
+            except ValueError:
+                parts = raw.split()
+            if len(parts) >= 2:
+                return {"collectionName": parts[0], "commandName": " ".join(parts[1:])}
+            return {"collectionName": raw}
+        if command == "forge_register":
+            try:
+                parts = shlex.split(raw)
+            except ValueError:
+                parts = raw.split()
+            if len(parts) >= 2:
+                remove = any(p.lower() in {"-remove", "--remove", "remove", "true", "1"} for p in parts[2:])
+                return {
+                    "collectionName": parts[0],
+                    "commandName": parts[1],
+                    "remove": remove,
+                }
+            return raw
 
         # Common commands that take a single text arg mapped to known Mythic arg names.
         if command in {"shell", "run", "execute"}:
@@ -162,10 +209,23 @@ class CommandHandler:
             if len(parts) >= 2:
                 return {"file": parts[0], "path": " ".join(parts[1:])}
             return {"file": raw}
-        if command in {"ls", "cd"}:
-            return {"filepath": raw}
+        if command == "ls":
+            return {"path": raw}
+        if command == "cd":
+            return {"directory": raw}
         if command == "help":
             return raw
+        if command == "sleep":
+            # sleep <seconds> [jitter]
+            try:
+                parts = raw.split()
+                if len(parts) == 1:
+                    return {"seconds": int(parts[0])}
+                if len(parts) >= 2:
+                    return {"seconds": int(parts[0]), "jitter": float(parts[1])}
+            except (ValueError, TypeError):
+                pass
+            return {"seconds": raw}
 
         # Xenon socks convenience form: "socks start 1080"
         if command == "socks":
@@ -498,6 +558,7 @@ Create a new payload interactively with guided parameter selection.
   - merlin: Cross-platform Go agent
   - sliver: Modern Go agent
   - hannibal: Windows shellcode agent
+  - forge: Command augmenter (BOF/Assembly collections for other agents)
 
 [dim]All parameters are prompted for interactively - no JSON needed![/dim]""",
 
@@ -1144,9 +1205,19 @@ Download a file from Mythic's repository to your local system.
             if not callback:
                 console.print(f"[red]Callback {callback_id} not found[/red]")
                 return
+            
+            # Use the internal ID for task creation, but keep display_id for UI
+            internal_callback_id = callback.get('id')
+            display_callback_id = callback.get('display_id', callback_id)
+            
+            # If callback_id was passed as display_id, use internal ID now
+            if internal_callback_id:
+                actual_callback_id = internal_callback_id
+            else:
+                actual_callback_id = callback_id
 
             try:
-                available_commands = self.client.get_callback_commands(callback_id)
+                available_commands = self.client.get_callback_commands(actual_callback_id)
             except MythicAPIException:
                 available_commands = []
 
@@ -1161,14 +1232,14 @@ Download a file from Mythic's repository to your local system.
             payload = callback.get('payload', {})
             payload_type = payload.get('payloadtype', {}).get('name', 'unknown') if payload else 'unknown'
 
-            console.print(f"\n[green]✅[/green] Interacting with callback {callback_id}: [cyan]{user}@{host}[/cyan]")
+            console.print(f"\n[green]✅[/green] Interacting with callback {display_callback_id}: [cyan]{user}@{host}[/cyan]")
             console.print(
                 f"[dim]Agent: {payload_type} | Type 'help' for agent commands, cls to clear the console, 'cli_help' for local CLI commands, or 'back' to exit[/dim]\n"
             )
 
             while True:
                 try:
-                    command_line = console.input(f"[yellow]callback-{callback_id}[/yellow] > ")
+                    command_line = console.input(f"[yellow]callback-{display_callback_id}[/yellow] > ")
 
                     if not command_line.strip():
                         continue
@@ -1192,7 +1263,7 @@ Download a file from Mythic's repository to your local system.
                     # Handle special local commands
                     if cmd_name == 'info':
                         # Refresh callback metadata to reflect latest GraphQL response
-                        latest_callback = self.client.get_callback(callback_id)
+                        latest_callback = self.client.get_callback(actual_callback_id)
                         if latest_callback:
                             callback = latest_callback
 
@@ -1245,7 +1316,7 @@ Download a file from Mythic's repository to your local system.
                         continue
 
                     if cmd_name == 'tasks':
-                        self.handle_tasks([str(callback_id)])
+                        self.handle_tasks([str(actual_callback_id)])
                         continue
 
                     if cmd_name in ['output', 'task-output']:
@@ -1279,8 +1350,53 @@ Download a file from Mythic's repository to your local system.
                     params = self._build_task_params(cmd_name, raw_args)
                     params, task_files = self._prepare_task_submission(cmd_name, params)
 
-                    # Create and display task
-                    task = self.client.create_task(callback_id, cmd_name, params, files=task_files)
+                    # Create and display task with retry logic for common parameter mismatches
+                    task = None
+                    task_creation_error = None
+                    
+                    try:
+                        task = self.client.create_task(actual_callback_id, cmd_name, params, files=task_files)
+                    except MythicAPIException as e:
+                        task_creation_error = str(e)
+                        # Try common parameter format alternatives if initial creation failed
+                        if raw_args and params is not None and not isinstance(params, dict):
+                            console.print(f"[yellow]⚠[/yellow]  First attempt failed, trying alternative parameter formats...")
+                            
+                            # Try wrapping raw text in common parameter names
+                            alternatives = [
+                                {"path": raw_args},          # For path-based commands
+                                {"filepath": raw_args},      # For file operations
+                                {"command": raw_args},       # For command execution
+                                {"args": raw_args},          # Generic args parameter
+                                raw_args,                    # Keep original
+                            ]
+                            
+                            for alt_params in alternatives:
+                                try:
+                                    alt_params_final, alt_files = self._prepare_task_submission(cmd_name, alt_params)
+                                    task = self.client.create_task(actual_callback_id, cmd_name, alt_params_final, files=alt_files)
+                                    task_creation_error = None
+                                    break
+                                except MythicAPIException:
+                                    continue
+                    
+                    if task_creation_error:
+                        console.print(f"[red]✗[/red] Task creation failed: {task_creation_error}")
+                        console.print(f"[dim]Command: {cmd_name} | Params: {params}[/dim]")
+                        
+                        # If the error is about command not found, show available commands
+                        if "Failed to fetch command by that name" in task_creation_error or "command" in task_creation_error.lower():
+                            if cmd_list:
+                                available = ", ".join(sorted(str(k) for k in cmd_list.keys() if k is not None))
+                                console.print(f"[yellow]Available commands:[/yellow] {available}")
+                            else:
+                                console.print("[yellow]Hint:[/yellow] Try running 'help' to see available commands")
+                        continue
+                    
+                    if not task:
+                        console.print("[red]✗[/red] Failed to create task")
+                        continue
+                    
                     display_task_id = task.get('display_id')
                     internal_task_id = task.get('id')
                     shown_task_id = display_task_id if isinstance(display_task_id, int) and display_task_id > 0 else internal_task_id

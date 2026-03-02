@@ -17,9 +17,28 @@ from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Input, ListItem, ListView, RichLog, Static
+from rich.markup import escape as rich_escape
 
 from mythic_cli.client import MythicAPIException, MythicClient
 from mythic_cli.config import ConfigManager
+
+
+def _safe_richlog_write(log: RichLog, text: str) -> None:
+    """Write to a RichLog without crashing on malformed markup content."""
+    content = str(text)
+    try:
+        log.write(content)
+        return
+    except Exception:
+        # Fallback to escaped text when markup parsing fails (common with agent output
+        # containing literal square-bracket sequences).
+        pass
+
+    try:
+        log.write(rich_escape(content))
+    except Exception:
+        # Final fallback: swallow write failure to avoid crashing the TUI.
+        return
 
 
 class LoginScreen(Screen[None]):
@@ -108,6 +127,7 @@ class LoginScreen(Screen[None]):
                 )
                 # Replace login screen with dashboard
                 self.app.pop_screen()
+                # If another screen is active after pop, push dashboard on top
                 self.app.push_screen(DashboardScreen())
                 return
             else:
@@ -201,12 +221,21 @@ class DashboardScreen(BaseScreen):
     def __init__(self) -> None:
         super().__init__()
         self._table_ready = False
+        self._callback_id_map: Dict[int, int] = {}  # Maps display index to actual callback ID
+        self._stats = {
+            "callbacks": {"total": 0, "active": 0, "inactive": 0},
+            "tasks": {"success": 0, "error": 0, "processing": 0, "submitted": 0},
+        }
 
     def compose_main_content(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="dash-body"):
             with Vertical(id="dash-left"):
-                yield Static("Dashboard", id="dash-status")
+                # Statistics panels at the top
+                with Horizontal(id="stats-row"):
+                    yield Static("", id="stats-callbacks")
+                    yield Static("", id="stats-tasks")
+                yield Static("Callbacks", id="dash-status")
                 yield DataTable(id="callbacks-table")
             with Vertical(id="dash-right"):
                 yield Static("Alerts", id="alerts-title")
@@ -222,16 +251,105 @@ class DashboardScreen(BaseScreen):
 
     async def on_mount(self) -> None:
         self._setup_table()
+        # Initialize stats display with placeholders
+        self._update_stats_display({
+            "callbacks": {"total": 0, "active": 0, "inactive": 0},
+            "tasks": {"total": 0, "success": 0, "error": 0, "processing": 0, "submitted": 0},
+        })
+        # Then fetch real stats
+        self.refresh_stats()
         self.refresh_callbacks()
         self.set_interval(3, self.refresh_callbacks)
+        self.set_interval(2, self.refresh_stats)
 
     def _setup_table(self) -> None:
         if self._table_ready:
             return
         table = self.query_one("#callbacks-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("ID", "Active", "OS", "Arch", "User", "Host", "IP", "Process", "Agent", "Last Checkin")
+        table.add_columns("ID", "Active", "OS", "Arch", "User", "Host", "IP", "Process", "Agent", "Integrity", "Last Checkin")
         self._table_ready = True
+
+    @work(thread=True, exclusive=True)
+    def refresh_stats(self) -> None:
+        """Fetch and update dashboard statistics."""
+        try:
+            # Fetch all callbacks to calculate active/inactive properly
+            callbacks = self._app.client.get_callbacks()
+            task_stats = self._app.client.get_task_statistics()
+            
+            # Calculate active/inactive using the same logic as the table display
+            total_callbacks = len(callbacks)
+            active_count = sum(1 for cb in callbacks if self._app.is_callback_active(cb))
+            inactive_count = total_callbacks - active_count
+            
+            dashboard_stats = {
+                "callbacks": {
+                    "total": total_callbacks,
+                    "active": active_count,
+                    "inactive": inactive_count,
+                },
+                "tasks": {
+                    "total": sum(task_stats.values()),
+                    "success": task_stats.get("success", 0),
+                    "error": task_stats.get("error", 0),
+                    "processing": task_stats.get("processing", 0),
+                    "submitted": task_stats.get("submitted", 0),
+                }
+            }
+            
+            self._app.call_from_thread(self._update_stats_display, dashboard_stats)
+        except Exception as exc:
+            # Log error to alerts panel for debugging
+            import traceback
+            error_details = f"Stats error: {str(exc)}"
+            self._app.call_from_thread(self.log_alert, f"[red]{error_details}[/red]")
+    
+    def _update_stats_display(self, stats: Dict[str, Any]) -> None:
+        """Update the statistics display widgets."""
+        self._stats = stats
+        
+        # Helper function to create a horizontal bar chart
+        def make_bar(value: int, max_value: int, width: int = 20) -> str:
+            if max_value == 0:
+                filled = 0
+            else:
+                filled = int((value / max_value) * width)
+            empty = width - filled
+            return "█" * filled + "░" * empty
+        
+        # Callbacks stats with visual bars
+        cb_total = stats['callbacks']['total']
+        cb_active = stats['callbacks']['active']
+        cb_inactive = stats['callbacks']['inactive']
+        
+        callbacks_text = (
+            f"[bold cyan]━━━ CALLBACKS ━━━[/bold cyan]\n"
+            f"Total: [white]{cb_total}[/white]\n"
+            f"[green]Active[/green]   {make_bar(cb_active, cb_total, 15)} [green]{cb_active}[/green]\n"
+            f"[red]Inactive[/red] {make_bar(cb_inactive, cb_total, 15)} [red]{cb_inactive}[/red]"
+        )
+        
+        # Tasks stats with visual bars
+        task_total = stats['tasks']['total']
+        task_success = stats['tasks']['success']
+        task_error = stats['tasks']['error']
+        task_processing = stats['tasks']['processing']
+        
+        tasks_text = (
+            f"[bold yellow]━━━━ TASKS ━━━━[/bold yellow]\n"
+            f"Total: [white]{task_total}[/white]\n"
+            f"[green]Success[/green]  {make_bar(task_success, max(task_total, 1), 12)} [green]{task_success}[/green]\n"
+            f"[red]Error[/red]    {make_bar(task_error, max(task_total, 1), 12)} [red]{task_error}[/red]\n"
+            f"[blue]Running[/blue]  {make_bar(task_processing, max(task_total, 1), 12)} [blue]{task_processing}[/blue]"
+        )
+        
+        try:
+            self.query_one("#stats-callbacks", Static).update(callbacks_text)
+            self.query_one("#stats-tasks", Static).update(tasks_text)
+        except Exception:
+            # Widgets might not be ready yet
+            pass
 
     @work(thread=True, exclusive=True)
     def refresh_callbacks(self) -> None:
@@ -259,11 +377,13 @@ class DashboardScreen(BaseScreen):
         self._update_status("[red]❌ Session expired - please login again[/red]")
         # Clear the API token so we force re-authentication
         self._app.client.api_token = ""
-        # Push login screen
-        self.app.push_screen(LoginScreen())
+        # Show login screen once; avoid stacking duplicate login screens
+        self._app.show_login_screen()
 
     def _apply_callbacks(self, callbacks: List[Dict[str, Any]]) -> None:
         table = self.query_one("#callbacks-table", DataTable)
+        # Save current cursor position before clearing
+        current_cursor_row = table.cursor_row if table.cursor_row < len(table.rows) else 0
         table.clear(columns=False)
 
         visible_callbacks: List[Dict[str, Any]] = []
@@ -287,7 +407,10 @@ class DashboardScreen(BaseScreen):
                     )
         self._app.known_callback_ids = current_ids
 
-        for cb in visible_callbacks:
+        # Clear the callback ID mapping
+        self._callback_id_map.clear()
+        
+        for idx, cb in enumerate(visible_callbacks, start=1):
             pid = cb.get("pid", "")
             process_name = cb.get("process_name", "")
             process_display = f"{pid} ({process_name})" if pid and process_name else (process_name or (str(pid) if pid else ""))
@@ -295,8 +418,23 @@ class DashboardScreen(BaseScreen):
             payloadtype = payload.get("payloadtype") or {}
             agent_name = payloadtype.get("name", "")
             is_active = self._app.is_callback_active(cb)
+            actual_callback_id = self._app.to_int(cb.get("id"))
+            
+            if actual_callback_id is None:
+                continue
+            
+            # Store mapping from display index to actual callback ID
+            self._callback_id_map[idx] = actual_callback_id
+            
+            # Format integrity level with emoji for high or above
+            integrity_level = cb.get("integrity_level", "")
+            integrity_display = str(integrity_level)
+            if integrity_level and str(integrity_level).lower() in {"high", "system"}:
+                integrity_display = f"{integrity_level} ‼️"
+            
+            # Use sequential index for display
             table.add_row(
-                str(cb.get("id", "")),
+                str(idx),
                 "✅" if is_active else "💀",
                 str(cb.get("os", "")),
                 str(cb.get("architecture", "")),
@@ -305,11 +443,16 @@ class DashboardScreen(BaseScreen):
                 str(cb.get("ip", "")),
                 process_display,
                 str(agent_name),
+                integrity_display,
                 self._app.format_timestamp(cb.get("last_checkin")),
             )
 
         hidden_count = len(callbacks) - len(visible_callbacks)
         self._update_status(f"[cyan]Callbacks:[/cyan] total={len(callbacks)} visible={len(visible_callbacks)} hidden={hidden_count}")
+        
+        # Restore cursor position if possible
+        if table.row_count > 0 and current_cursor_row < table.row_count:
+            table.move_cursor(row=current_cursor_row)
 
     def _update_status(self, message: str) -> None:
         self.query_one("#dash-status", Static).update(message)
@@ -317,17 +460,31 @@ class DashboardScreen(BaseScreen):
     def log_alert(self, message: str) -> None:
         log = self.query_one("#dash-alerts", RichLog)
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log.write(f"[{timestamp}] {message}")
+        _safe_richlog_write(log, f"[{timestamp}] {message}")
 
     async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "callbacks-table":
             return
+        # Get the row data and extract the display index
         row = event.data_table.get_row(event.row_key)
         if not row:
             return
-        callback_id = self._app.to_int(row[0])
-        if callback_id is not None:
-            self.app.push_screen(CallbackScreen(callback_id))
+        try:
+            display_idx = int(row[0])
+            # Look up the actual callback ID from our mapping
+            callback_id = self._callback_id_map.get(display_idx)
+            if callback_id is not None:
+                self.app.push_screen(CallbackScreen(callback_id))
+        except (ValueError, IndexError):
+            self.log_alert("[red]Invalid callback selection[/red]")
+
+    def _resolve_callback_id(self, input_id: int) -> int:
+        """Resolve display index to actual callback ID if applicable."""
+        # Check if input is a display index in the current table
+        if input_id in self._callback_id_map:
+            return self._callback_id_map[input_id]
+        # Otherwise return the input as-is (it's already an actual callback ID)
+        return input_id
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "dash-input":
@@ -359,7 +516,9 @@ class DashboardScreen(BaseScreen):
             if callback_id is None:
                 self.log_alert(f"[red]Invalid callback ID:[/red] {args[0]}")
                 return
-            self.app.push_screen(CallbackScreen(callback_id))
+            # Resolve display index to actual callback ID if needed
+            actual_id = self._resolve_callback_id(callback_id)
+            self.app.push_screen(CallbackScreen(actual_id))
             return
         if cmd in {"help", "?"}:
             self.log_alert("[cyan]Dashboard commands:[/cyan] open <id>, hide/unhide, hidden, clear-hidden, files, login, theme, download-file, upload-file, refresh")
@@ -380,7 +539,7 @@ class DashboardScreen(BaseScreen):
                 self.log_alert(f"[cyan]Available:[/cyan] {', '.join(self._app.AVAILABLE_THEMES)}")
             return
         if cmd == "login":
-            self.app.push_screen(LoginScreen())
+            self._app.show_login_screen()
             return
         if cmd == "hidden":
             if not self._app.hidden_callback_ids:
@@ -404,7 +563,9 @@ class DashboardScreen(BaseScreen):
                 if val is None:
                     self.log_alert(f"[red]Invalid callback ID:[/red] {item}")
                     return
-                parsed_ids.add(val)
+                # Resolve display index to actual callback ID if needed
+                actual_id = self._resolve_callback_id(val)
+                parsed_ids.add(actual_id)
             if cmd == "hide":
                 self._app.hidden_callback_ids.update(parsed_ids)
                 self.log_alert(f"[green]✅ Hidden:[/green] {', '.join(str(i) for i in sorted(parsed_ids))}")
@@ -525,7 +686,7 @@ class FilesScreen(BaseScreen):
             )
 
     def _append_log(self, text: str) -> None:
-        self.query_one("#files-log", RichLog).write(text)
+        _safe_richlog_write(self.query_one("#files-log", RichLog), text)
 
     async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "files-table":
@@ -544,22 +705,22 @@ class FilesScreen(BaseScreen):
     def _show_file_info(self, f: Dict[str, Any]) -> None:
         log = self.query_one("#files-log", RichLog)
         log.clear()
-        uuid = str(f.get("agent_file_id", ""))
-        name = f.get("filename_utf8") or f.get("filename") or f.get("filename_text") or "Unknown"
+        uuid = rich_escape(str(f.get("agent_file_id", "")))
+        name = rich_escape(str(f.get("filename_utf8") or f.get("filename") or f.get("filename_text") or "Unknown"))
         size = f.get("size", 0)
-        uploaded = self._app.format_timestamp(f.get("timestamp"))
-        mime = f.get("mime_type", "Unknown")
+        uploaded = rich_escape(str(self._app.format_timestamp(f.get("timestamp"))))
+        mime = rich_escape(str(f.get("mime_type", "Unknown")))
         
-        log.write(f"[cyan]File Details[/cyan]")
-        log.write(f"UUID:     {uuid}")
-        log.write(f"Name:     {name}")
-        log.write(f"Size:     {size} bytes")
-        log.write(f"Uploaded: {uploaded}")
-        log.write(f"MIME:     {mime}")
-        log.write("")
-        log.write("[yellow]Commands:[/yellow]")
-        log.write(f"  download {uuid} <path>")
-        log.write(f"  download {uuid[:8]} <path>  (partial UUID)")
+        _safe_richlog_write(log, "[cyan]File Details[/cyan]")
+        _safe_richlog_write(log, f"UUID:     {uuid}")
+        _safe_richlog_write(log, f"Name:     {name}")
+        _safe_richlog_write(log, f"Size:     {size} bytes")
+        _safe_richlog_write(log, f"Uploaded: {uploaded}")
+        _safe_richlog_write(log, f"MIME:     {mime}")
+        _safe_richlog_write(log, "")
+        _safe_richlog_write(log, "[yellow]Commands:[/yellow]")
+        _safe_richlog_write(log, f"  download {uuid} <path>")
+        _safe_richlog_write(log, f"  download {uuid[:8]} <path>  (partial UUID)")
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "files-input":
@@ -742,18 +903,18 @@ class CallbackScreen(BaseScreen):
         self._app.call_from_thread(self._apply_commands_catalog, commands)
 
     def _append_commands_log(self, text: str) -> None:
-        self.query_one("#commands-log", RichLog).write(text)
+        _safe_richlog_write(self.query_one("#commands-log", RichLog), text)
 
     def _apply_commands_catalog(self, commands: List[Dict[str, Any]]) -> None:
         log = self.query_one("#commands-log", RichLog)
         log.clear()
         if not commands:
-            log.write("[dim]No command metadata available[/dim]")
+            _safe_richlog_write(log, "[dim]No command metadata available[/dim]")
             return
         for cmd in sorted(commands, key=lambda c: str(c.get("cmd", ""))):
-            name = cmd.get("cmd", "")
-            help_cmd = cmd.get("help_cmd") or cmd.get("description") or ""
-            log.write(f"[white]{name}[/white] - {help_cmd}")
+            name = rich_escape(str(cmd.get("cmd", "")))
+            help_cmd = rich_escape(str(cmd.get("help_cmd") or cmd.get("description") or ""))
+            _safe_richlog_write(log, f"[white]{name}[/white] - {help_cmd}")
         self._commands_loaded = True
 
     @work(thread=True, exclusive=True)
@@ -788,7 +949,7 @@ class CallbackScreen(BaseScreen):
     def _append_output(self, text: str) -> None:
         log = self.query_one("#output-log", RichLog)
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log.write(f"[{timestamp}] {text}")
+        _safe_richlog_write(log, f"[{timestamp}] {text}")
 
     async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "tasks-table":
@@ -814,12 +975,13 @@ class CallbackScreen(BaseScreen):
             return
         self._app.call_from_thread(self._append_output, f"[cyan]Task {task_id} output:[/cyan]")
         for out in outputs:
-            ts = out.get("timestamp", "")
+            ts = rich_escape(str(out.get("timestamp", "")))
             text = out.get("response") or out.get("response_escape") or ""
             text = self._app.decode_response_text(str(text))
             if len(text) > 4000:
                 text = text[:4000] + "\n... [truncated]"
-            self._app.call_from_thread(self._append_output, f"[dim]{ts}[/dim]\n{text}")
+            safe_text = rich_escape(text)
+            self._app.call_from_thread(self._append_output, f"[dim]{ts}[/dim]\n{safe_text}")
 
     @work(thread=True)
     def _fetch_and_display_task_output(self, task_id: int) -> None:
@@ -837,39 +999,82 @@ class CallbackScreen(BaseScreen):
         
         # Display outputs
         for out in outputs:
-            ts = out.get("timestamp", "")
+            ts = rich_escape(str(out.get("timestamp", "")))
             text = out.get("response") or out.get("response_escape") or ""
             text = self._app.decode_response_text(str(text))
             if len(text) > 4000:
                 text = text[:4000] + "\n... [truncated]"
-            self._app.call_from_thread(self._append_output, f"[dim]{ts}[/dim]\n{text}")
+            safe_text = rich_escape(text)
+            self._app.call_from_thread(self._append_output, f"[dim]{ts}[/dim]\n{safe_text}")
 
     def _create_task(self, command: str, arg_text: str = "") -> None:
-        params = self._app.build_task_params(command, arg_text)
-        try:
-            task = self._app.client.create_task(self.callback_id, command, params)
-            internal_id = task.get("id")
-            display_id = task.get("display_id")
-            error_msg = task.get("error", "")
-            
-            # Check if task creation failed
-            internal_ok = isinstance(internal_id, int) and internal_id > 0
-            display_ok = isinstance(display_id, int) and display_id > 0
-            
-            if not internal_ok and not display_ok:
-                if error_msg:
-                    self._append_output(f"[red]❌ Task failed:[/red] {error_msg}")
-                else:
-                    self._append_output("[red]❌ Task failed to create[/red]")
-                return
-            
-            shown_id = display_id if display_ok else internal_id
-            if isinstance(internal_id, int) and internal_id > 0:
-                self.last_task_id = internal_id
-            self._append_output(f"[green]✅ Task created[/green] cmd={command} id={shown_id}")
-            self.refresh_tasks()
-        except Exception as exc:
-            self._append_output(f"[red]❌ Task creation failed:[/red] {exc}")
+        raw = arg_text.strip()
+        primary_params = self._app.build_task_params(command, arg_text)
+
+        # Build fallback param shapes for agent-specific command parsing differences.
+        attempts: List[Optional[Any]] = [primary_params]
+        if raw:
+            if command == "cd":
+                attempts.extend([
+                    {"directory": raw},
+                    {"path": raw},
+                    {"filepath": raw},
+                    raw,
+                ])
+            elif command == "ls":
+                attempts.extend([
+                    {"path": raw},
+                    {"directory": raw},
+                    {"filepath": raw},
+                    raw,
+                ])
+            else:
+                attempts.extend([
+                    {"path": raw},
+                    {"filepath": raw},
+                    {"command": raw},
+                    {"args": raw},
+                    raw,
+                ])
+
+        # Deduplicate attempts while preserving order
+        seen: Set[str] = set()
+        unique_attempts: List[Optional[Any]] = []
+        for candidate in attempts:
+            try:
+                key = json.dumps(candidate, sort_keys=True)
+            except TypeError:
+                key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_attempts.append(candidate)
+
+        task: Optional[Dict[str, Any]] = None
+        last_error: Optional[str] = None
+        for idx, candidate_params in enumerate(unique_attempts):
+            try:
+                task = self._app.client.create_task(self.callback_id, command, candidate_params)
+                last_error = None
+                if idx > 0:
+                    self._append_output(f"[yellow]⚠[/yellow] Retried with alternate params and task was accepted")
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                task = None
+                continue
+
+        if not task:
+            self._append_output(f"[red]❌ Task creation failed:[/red] {last_error or 'unknown error'}")
+            return
+
+        internal_id = task.get("id")
+        display_id = task.get("display_id")
+        shown_id = display_id if isinstance(display_id, int) and display_id > 0 else internal_id
+        if isinstance(internal_id, int) and internal_id > 0:
+            self.last_task_id = internal_id
+        self._append_output(f"[green]✅ Task created[/green] cmd={command} id={shown_id}")
+        self.refresh_tasks()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "cb-input":
@@ -883,7 +1088,8 @@ class CallbackScreen(BaseScreen):
             parts = shlex.split(raw)
         except ValueError:
             parts = raw.split()
-        cmd = parts[0].lower()
+        cmd_input = parts[0]
+        cmd = cmd_input.lower()
         args = parts[1:]
 
         if cmd in {"back", "quit"}:
@@ -953,9 +1159,12 @@ class CallbackScreen(BaseScreen):
                 self._append_output(f"[red]upload-file failed:[/red] {exc}")
             return
 
+        # Preserve exact casing for forge_* augmented commands.
+        task_command = cmd_input if cmd_input.startswith("forge_") else cmd
+
         arg_text = " ".join(args) if args else ""
         try:
-            self._create_task(cmd, arg_text)
+            self._create_task(task_command, arg_text)
         except Exception as exc:
             self._append_output(f"[red]task failed:[/red] {exc}")
 
@@ -987,6 +1196,19 @@ class MythicTextualApp(App[None]):
     ListView > ListItem.separator { 
         height: 1; 
         color: $text-muted;
+    }
+    
+    /* Dashboard Stats Row */
+    #stats-row {
+        height: 8;
+        margin-bottom: 1;
+    }
+    #stats-callbacks, #stats-tasks {
+        width: 1fr;
+        height: 100%;
+        border: solid $accent;
+        padding: 1;
+        margin: 0 1;
     }
     
     #dash-body, #cb-body { height: 1fr; }
@@ -1081,7 +1303,13 @@ class MythicTextualApp(App[None]):
         if is_authenticated:
             self.push_screen(DashboardScreen())
         else:
-            self.push_screen(LoginScreen())
+            self.show_login_screen()
+
+    def show_login_screen(self) -> None:
+        """Show login screen if it is not already the current screen."""
+        if isinstance(self.screen, LoginScreen):
+            return
+        self.push_screen(LoginScreen())
 
     async def authenticate(self) -> bool:
         """Try to authenticate using stored credentials or API token.
@@ -1246,7 +1474,7 @@ class MythicTextualApp(App[None]):
         raw = arg_text.strip()
         if not raw:
             if command == "ls":
-                return {"filepath": "."}
+                return {"path": "."}
             return None
         try:
             return json.loads(raw)
@@ -1254,12 +1482,37 @@ class MythicTextualApp(App[None]):
             pass
         
         # Handle specific commands with special argument parsing
+        if command == "forge_collections":
+            return {"collectionName": raw}
+        if command == "forge_download":
+            try:
+                parts = shlex.split(raw)
+            except ValueError:
+                parts = raw.split()
+            if len(parts) >= 2:
+                return {"collectionName": parts[0], "commandName": " ".join(parts[1:])}
+            return {"collectionName": raw}
+        if command == "forge_register":
+            try:
+                parts = shlex.split(raw)
+            except ValueError:
+                parts = raw.split()
+            if len(parts) >= 2:
+                remove = any(p.lower() in {"-remove", "--remove", "remove", "true", "1"} for p in parts[2:])
+                return {
+                    "collectionName": parts[0],
+                    "commandName": parts[1],
+                    "remove": remove,
+                }
+            return raw
         if command in {"shell", "run", "execute"}:
             return {"command": raw}
         if command == "download":
             return {"path": raw}
-        if command in {"ls", "cd"}:
-            return {"filepath": raw}
+        if command == "ls":
+            return {"path": raw}
+        if command == "cd":
+            return {"directory": raw}
         if command == "help":
             return raw
         

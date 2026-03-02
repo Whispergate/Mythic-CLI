@@ -317,7 +317,7 @@ class MythicClient:
         return result.get("callback_by_pk", {})
 
     def get_callback_commands(self, callback_id: int) -> List[Dict[str, Any]]:
-        """Get available commands for a callback based on its payload type.
+        """Get available commands for a callback based on loaded commands.
 
         Args:
             callback_id: ID of the callback.
@@ -328,6 +328,16 @@ class MythicClient:
         query = """
         query GetCallbackCommands($id: Int!) {
             callback_by_pk(id: $id) {
+                loadedcommands {
+                    command {
+                        cmd
+                        description
+                        help_cmd
+                        payloadtype {
+                            name
+                        }
+                    }
+                }
                 payload {
                     payloadtype {
                         name
@@ -343,6 +353,17 @@ class MythicClient:
         """
         result = self._graphql_query(query, {"id": callback_id})
         callback = result.get("callback_by_pk", {})
+        
+        # First try to get loaded commands (actual commands available to this callback)
+        if callback and "loadedcommands" in callback and callback["loadedcommands"]:
+            loaded_cmds = []
+            for lc in callback["loadedcommands"]:
+                if lc.get("command"):
+                    loaded_cmds.append(lc["command"])
+            if loaded_cmds:
+                return loaded_cmds
+        
+        # Fallback to payload type commands if no loaded commands found
         if callback and "payload" in callback and callback["payload"]:
             payload = callback["payload"]
             if "payloadtype" in payload and payload["payloadtype"]:
@@ -392,6 +413,8 @@ class MythicClient:
         command: str,
         params: Optional[Any] = None,
         files: Optional[List[str]] = None,
+        payload_type: Optional[str] = None,
+        parameter_group_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a new task for a callback.
 
@@ -405,8 +428,22 @@ class MythicClient:
             Created task data.
         """
         mutation = """
-        mutation CreateTask($callback_id: Int!, $command: String!, $params: String!, $files: [String]) {
-            createTask(callback_id: $callback_id, command: $command, params: $params, files: $files) {
+        mutation CreateTask(
+            $callback_id: Int!
+            $command: String!
+            $params: String!
+            $files: [String]
+            $payload_type: String
+            $parameter_group_name: String
+        ) {
+            createTask(
+                callback_id: $callback_id,
+                command: $command,
+                params: $params,
+                files: $files,
+                payload_type: $payload_type,
+                parameter_group_name: $parameter_group_name
+            ) {
                 id
                 display_id
                 status
@@ -423,17 +460,54 @@ class MythicClient:
         else:
             serialized_params = json.dumps(params)
 
-        def _submit_task(target_callback_id: int) -> Dict[str, Any]:
+        def _submit_task(
+            target_callback_id: int,
+            target_payload_type: Optional[str] = None,
+            target_parameter_group_name: Optional[str] = None,
+        ) -> Dict[str, Any]:
             variables = {
                 "callback_id": target_callback_id,
                 "command": command,
                 "params": serialized_params,
                 "files": files if files else None,
+                "payload_type": target_payload_type,
+                "parameter_group_name": target_parameter_group_name,
             }
             result = self._graphql_query(mutation, variables)
             return result.get("createTask", {}) or {}
 
-        task = _submit_task(callback_id)
+        def _task_is_ok(candidate: Dict[str, Any]) -> bool:
+            internal_id = candidate.get("id")
+            display_id = candidate.get("display_id")
+            internal_ok = isinstance(internal_id, int) and internal_id > 0
+            display_ok = isinstance(display_id, int) and display_id > 0
+            return internal_ok or display_ok
+
+        def _resolve_display_callback_id(source_callback_id: int) -> Optional[int]:
+            try:
+                callback = self.get_callback(source_callback_id)
+            except Exception:
+                return None
+            display_callback_id = callback.get("display_id") if callback else None
+            if isinstance(display_callback_id, int) and display_callback_id > 0 and display_callback_id != source_callback_id:
+                return display_callback_id
+            return None
+
+        def _find_command_payload_type(source_callback_id: int, command_name: str) -> Optional[str]:
+            try:
+                commands = self.get_callback_commands(source_callback_id)
+            except Exception:
+                return None
+            for cmd_meta in commands:
+                if (cmd_meta or {}).get("cmd") != command_name:
+                    continue
+                pt = ((cmd_meta or {}).get("payloadtype") or {}).get("name")
+                if isinstance(pt, str) and pt.strip():
+                    return pt.strip()
+                return None
+            return None
+
+        task = _submit_task(callback_id, payload_type, parameter_group_name)
 
         # Mythic can return a task-like object with id/display_id of 0 for failed/invalid tasking.
         # Treat non-positive IDs as task creation failure to avoid false success messages.
@@ -454,26 +528,52 @@ class MythicClient:
                 and isinstance(callback_id, int)
                 and callback_id > 0
             ):
-                try:
-                    callback = self.get_callback(callback_id)
-                    display_callback_id = callback.get("display_id") if callback else None
-                    if isinstance(display_callback_id, int) and display_callback_id > 0 and display_callback_id != callback_id:
-                        retry_task = _submit_task(display_callback_id)
-                        retry_internal_id = retry_task.get("id")
-                        retry_display_id = retry_task.get("display_id")
-                        retry_internal_ok = isinstance(retry_internal_id, int) and retry_internal_id > 0
-                        retry_display_ok = isinstance(retry_display_id, int) and retry_display_id > 0
-                        if retry_internal_ok or retry_display_ok:
-                            return retry_task
+                display_callback_id = _resolve_display_callback_id(callback_id)
+                if display_callback_id is not None:
+                    retry_task = _submit_task(display_callback_id, payload_type, parameter_group_name)
+                    if _task_is_ok(retry_task):
+                        return retry_task
+                    task = retry_task
+                    internal_id = retry_task.get("id")
+                    display_id = retry_task.get("display_id")
+                    status = retry_task.get("status", "")
+                    error_msg = retry_task.get("error", "")
 
+            # Command augmenters (e.g. forge) can register commands whose payload type differs
+            # from the callback's primary payload type. Retry with command payload type if available.
+            if (
+                isinstance(error_msg, str)
+                and "failed to find command matching payload type" in error_msg.lower()
+                and isinstance(callback_id, int)
+                and callback_id > 0
+            ):
+                command_payload_type = payload_type or _find_command_payload_type(callback_id, command)
+                if command_payload_type:
+                    retry_task = _submit_task(callback_id, command_payload_type, parameter_group_name)
+                    if _task_is_ok(retry_task):
+                        return retry_task
+
+                    retry_error_msg = retry_task.get("error", "")
+                    if isinstance(retry_error_msg, str) and "Failed to get callback information" in retry_error_msg:
+                        display_callback_id = _resolve_display_callback_id(callback_id)
+                        if display_callback_id is not None:
+                            retry_task_2 = _submit_task(
+                                display_callback_id,
+                                command_payload_type,
+                                parameter_group_name,
+                            )
+                            if _task_is_ok(retry_task_2):
+                                return retry_task_2
+                            task = retry_task_2
+                        else:
+                            task = retry_task
+                    else:
                         task = retry_task
-                        internal_id = retry_internal_id
-                        display_id = retry_display_id
-                        status = retry_task.get("status", "")
-                        error_msg = retry_task.get("error", "")
-                except Exception:
-                    # Keep original error handling path if resolution/retry fails.
-                    pass
+
+                    internal_id = task.get("id")
+                    display_id = task.get("display_id")
+                    status = task.get("status", "")
+                    error_msg = task.get("error", "")
 
             status_msg = f" (status: {status})" if status else ""
             error_detail = f"\nError: {error_msg}" if error_msg else ""
@@ -792,6 +892,83 @@ class MythicClient:
             Updated operation data.
         """
         raise MythicAPIException("Setting current operation not yet implemented via GraphQL.")
+
+    def get_dashboard_stats(self) -> Dict[str, Any]:
+        """Get dashboard statistics including callbacks and tasks.
+
+        Returns:
+            Dictionary with statistics for callbacks and tasks.
+        """
+        query = """
+        query GetDashboardStats {
+            callback_aggregate {
+                aggregate {
+                    count
+                }
+            }
+            callback(where: {active: {_eq: true}}) {
+                id
+            }
+        }
+        """
+        result = self._graphql_query(query)
+        
+        total_callbacks = result.get("callback_aggregate", {}).get("aggregate", {}).get("count", 0)
+        active_callbacks = len(result.get("callback", []))
+        
+        return {
+            "callbacks": {
+                "total": total_callbacks,
+                "active": active_callbacks,
+                "inactive": total_callbacks - active_callbacks,
+            },
+            "tasks": {
+                "total": 0,
+                "success": 0,
+                "error": 0,
+                "processing": 0,
+                "submitted": 0,
+            }
+        }
+    
+    def get_task_statistics(self) -> Dict[str, int]:
+        """Get task statistics by status.
+
+        Returns:
+            Dictionary with task counts by status.
+        """
+        query = """
+        query GetTaskStats {
+            task_aggregate(where: {status: {_eq: "success"}}) {
+                aggregate {
+                    count
+                }
+            }
+            task_aggregate_error: task_aggregate(where: {status: {_in: ["error", "killed", "failed"]}}) {
+                aggregate {
+                    count
+                }
+            }
+            task_aggregate_processing: task_aggregate(where: {status: {_eq: "processing"}}) {
+                aggregate {
+                    count
+                }
+            }
+            task_aggregate_submitted: task_aggregate(where: {status: {_eq: "submitted"}}) {
+                aggregate {
+                    count
+                }
+            }
+        }
+        """
+        result = self._graphql_query(query)
+        
+        return {
+            "success": result.get("task_aggregate", {}).get("aggregate", {}).get("count", 0),
+            "error": result.get("task_aggregate_error", {}).get("aggregate", {}).get("count", 0),
+            "processing": result.get("task_aggregate_processing", {}).get("aggregate", {}).get("count", 0),
+            "submitted": result.get("task_aggregate_submitted", {}).get("aggregate", {}).get("count", 0),
+        }
 
     # C2 Profile operations
     def get_c2_profiles(self) -> List[Dict[str, Any]]:

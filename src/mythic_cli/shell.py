@@ -478,18 +478,18 @@ Server: [yellow]{server}[/yellow]
             callbacks = self.client.get_callbacks()
             with self._monitor_lock:
                 self._known_callback_ids = {cb.get("id") for cb in callbacks if cb.get("id")}
-            console.print(f"[*] Initialized monitoring with {len(self._known_callback_ids)} known callbacks")
+            # console.print(f"[*] Initialized monitoring with {len(self._known_callback_ids)} known callbacks")
         except Exception as e:
             console.print(f"[!] Error initializing monitoring: {e}")
 
         monitor_thread = threading.Thread(target=self._monitor_callbacks_loop, daemon=False)
         monitor_thread.name = "CallbackMonitor"
         monitor_thread.start()
-        console.print("[*] Callback monitoring thread started (non-daemon)")
+        # console.print("[*] Callback monitoring thread started (non-daemon)")
 
     def _monitor_callbacks_loop(self) -> None:
         """Background thread loop that monitors callbacks."""
-        console.print("[*] [MONITOR] Thread loop started")
+        # console.print("[*] [MONITOR] Thread loop started")
         poll_count = 0
         while self.running and self._monitoring:
             try:
@@ -520,8 +520,8 @@ Server: [yellow]{server}[/yellow]
 
                 # Check for new callbacks
                 new_ids = current_ids - self._known_callback_ids
-                # if new_ids:
-                #     console.print(f"[!] [MONITOR] Found {len(new_ids)} new callback(s): {new_ids}")
+                if new_ids:
+                    console.print(f"[!] [MONITOR] Found {len(new_ids)} new callback(s): {new_ids}")
 
                 if new_ids:
                     # Get details about new callbacks
@@ -537,7 +537,6 @@ Server: [yellow]{server}[/yellow]
 
                         alert_text += f"\n  ID: [cyan]{cb.get('id')}[/cyan] | User: [green]{cb.get('user', 'N/A')}[/green] | Host: [yellow]{cb.get('host', 'N/A')}[/yellow] | Process: [white]{process_display}[/white]"
 
-                    # Display alert with distinctive styling
                     alert = Panel(
                         f"[bold green]✅ New Callback(s) Registered{alert_text}[/bold green]",
                         border_style="green",
