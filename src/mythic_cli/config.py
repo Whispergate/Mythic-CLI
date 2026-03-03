@@ -11,11 +11,11 @@ from pydantic import BaseModel, Field
 class MythicConfig(BaseModel):
     """Configuration for Mythic server connection."""
 
-    server_url: str = Field(default="http://127.0.0.1:7443", description="Mythic server URL")
+    server_url: str = Field(default="https://127.0.0.1:7443", description="Mythic server URL")
     api_key: Optional[str] = Field(default=None, description="API token for authentication")
     username: Optional[str] = Field(default=None, description="Username for login")
     password: Optional[str] = Field(default=None, description="Password for login")
-    verify_ssl: bool = Field(default=True, description="Verify SSL certificates")
+    verify_ssl: bool = Field(default=False, description="Verify SSL certificates")
     timeout: int = Field(default=30, description="Request timeout in seconds")
     tui_theme: str = Field(
         default="default",
