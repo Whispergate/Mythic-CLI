@@ -14,6 +14,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.markup import escape as rich_escape
+from rich.progress import Progress, TimeRemainingColumn
 
 from .client import MythicClient, MythicAPIException
 from .themes import get_supported_themes, get_syntax_theme, normalize_theme_name
@@ -1644,41 +1645,122 @@ Download a file from Mythic's repository to your local system.
 
     def handle_payload_create(self, args: List[str]) -> None:
         """Create a payload interactively."""
-        # Get payload type and supported OS
-        if len(args) < 2:
-            console.print("[yellow]Interactive payload creation[/yellow]")
-            console.print("\n[cyan]Available payload types:[/cyan]")
+        try:
+            payload_types = self.client.get_payload_types()
+        except MythicAPIException as e:
+            console.print(f"[red]Error fetching payload types:[/red] {str(e)}")
+            return
 
+        if not payload_types:
+            console.print("[red]No payload types available[/red]")
+            return
+
+        def _parse_typed_value(raw_value: Any, parameter_type: str) -> Any:
+            """Convert user-entered values into types expected by Mythic payload build params."""
+            if raw_value is None:
+                return None
+
+            if isinstance(raw_value, (bool, int, float, dict, list)):
+                return raw_value
+
+            value = str(raw_value).strip()
+            ptype = (parameter_type or "").lower()
+
+            if value == "":
+                return ""
+
+            # STRING types must stay as strings - return immediately
+            if ptype in {"string", "str", "text"}:
+                return value
+
+            if ptype in {"boolean", "bool"}:
+                if value.lower() in {"true", "t", "1", "yes", "y"}:
+                    return True
+                if value.lower() in {"false", "f", "0", "no", "n"}:
+                    return False
+                return value
+
+            if ptype in {"number", "integer", "int"}:
+                try:
+                    return int(value)
+                except ValueError:
+                    try:
+                        return float(value)
+                    except ValueError:
+                        return value
+
+            if ptype in {"dictionary", "array"}:
+                try:
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    return value
+
+            # Best-effort fallback for untyped/text params.
+            if value.lower() in {"true", "false"}:
+                return value.lower() == "true"
             try:
-                payload_types = self.client.get_payload_types()
-            except MythicAPIException as e:
-                console.print(f"[red]Error fetching payload types:[/red] {str(e)}")
+                return int(value)
+            except ValueError:
+                try:
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    return value
+
+        payload_type_name: Optional[str] = None
+        selected_os: Optional[str] = None
+
+        # Non-interactive: payload-create <os> <payload_type>
+        if len(args) >= 2:
+            selected_os = args[0]
+            payload_type_name = args[1]
+        else:
+            console.print("[yellow]Interactive payload creation[/yellow]")
+
+            # OS selection first
+            all_os = sorted(set(os_name for pt in payload_types for os_name in pt.get("supported_os", [])))
+            if not all_os:
+                console.print("[red]No operating systems available[/red]")
                 return
 
-            if not payload_types:
-                console.print("[red]No payload types available[/red]")
+            console.print("\n[cyan]Available OS:[/cyan]")
+            os_map: Dict[str, str] = {}
+            for i, os_name in enumerate(all_os, 1):
+                os_map[str(i)] = os_name
+                console.print(f"  {i}. {os_name}")
+
+            os_choice = console.input("\n[cyan]Select OS (number or name): [/cyan]").strip()
+            if os_choice in os_map:
+                selected_os = os_map[os_choice]
+            elif os_choice in all_os:
+                selected_os = os_choice
+            else:
+                console.print(f"[red]Unknown OS: {os_choice}[/red]")
                 return
 
-            # Display available payload types
-            type_map = {}
-            for i, pt in enumerate(payload_types, 1):
+            # Filter payload types by selected OS
+            filtered_payload_types = [
+                pt for pt in payload_types
+                if selected_os in pt.get("supported_os", []) and not pt.get("wrapper", False)
+            ]
+            if not filtered_payload_types:
+                console.print(f"[red]No payload types available for OS '{selected_os}'[/red]")
+                return
+
+            console.print("\n[cyan]Available payload types:[/cyan]")
+            type_map: Dict[str, str] = {}
+            for i, pt in enumerate(filtered_payload_types, 1):
                 os_list = ", ".join(pt.get("supported_os", []))
                 console.print(f"  {i}. {pt['name']} ({os_list})")
-                type_map[str(i)] = pt['name']
+                type_map[str(i)] = pt["name"]
 
-            choice = console.input("\n[cyan]Select payload type (number or name): [/cyan]")
-
-            # Resolve choice to payload type name
+            choice = console.input("\n[cyan]Select payload type (number or name): [/cyan]").strip()
             if choice in type_map:
                 payload_type_name = type_map[choice]
             else:
                 payload_type_name = choice
-                # Verify it exists
-                if payload_type_name not in [pt['name'] for pt in payload_types]:
-                    console.print(f"[red]Unknown payload type: {payload_type_name}[/red]")
+                if payload_type_name not in [pt["name"] for pt in filtered_payload_types]:
+                    console.print(f"[red]Unknown payload type for {selected_os}: {payload_type_name}[/red]")
                     return
-        else:
-            payload_type_name = args[1]
 
         # Get payload type details
         try:
@@ -1691,107 +1773,325 @@ Download a file from Mythic's repository to your local system.
             console.print(f"[red]Payload type '{payload_type_name}' not found[/red]")
             return
 
+        supported_os = payload_type.get("supported_os", [])
+        if not selected_os:
+            # Backward compatible fallback if caller passed only payload type by mistake.
+            selected_os = supported_os[0] if supported_os else ""
+
+        if supported_os and selected_os not in supported_os:
+            console.print(
+                f"[red]Payload type '{payload_type_name}' does not support OS '{selected_os}'. "
+                f"Supported: {', '.join(supported_os)}[/red]"
+            )
+            return
+
         console.print(f"\n[green]✅[/green] Payload Type: [cyan]{payload_type['name']}[/cyan]")
-        console.print(f"  Supported OS: {', '.join(payload_type.get('supported_os', ['Unknown']))}")
+        console.print(f"  Selected OS: {selected_os}")
 
         # Gather build parameters
         console.print("\n[cyan]Build Parameters:[/cyan]")
-        build_params = {}
+        build_params: Dict[str, Any] = {}
 
-        for param in payload_type.get('buildparameters', []):
-            param_name = param['name']
-            param_type = param['parameter_type']
-            description = param.get('description', '')
-            required = param.get('required', False)
-            default = param.get('default_value', '')
-            choices_str = param.get('choices', '')  # Get choices if available
+        for param in payload_type.get("buildparameters", []):
+            param_name = param.get("name", "")
+            param_type = param.get("parameter_type", "")
+            description = param.get("description", "")
+            required = param.get("required", False)
+            default = param.get("default_value", "")
+            choices_raw = param.get("choices", [])
 
-            # Display parameter info
             required_str = "[red](required)[/red]" if required else "[dim](optional)[/dim]"
             console.print(f"  {param_name} {required_str}")
             if description:
                 console.print(f"    [dim]{description}[/dim]")
-            if default:
+            if default not in (None, ""):
                 console.print(f"    [dim]Default: {default}[/dim]")
 
-            # Prompt for value
-            if param_type == "ChooseOne":
-                # Try to parse choices from the 'choices' field first, then from description
-                if choices_str:
-                    # If there's a choices field, parse it (could be comma-separated or other format)
-                    if isinstance(choices_str, str):
-                        choice_list = [s.strip() for s in choices_str.split(",") if s.strip()]
-                    elif isinstance(choices_str, list):
-                        choice_list = choices_str
-                    else:
-                        choice_list = []
-
-                    if choice_list:
-                        console.print(f"    [cyan]Options:[/cyan]")
-                        for i, choice in enumerate(choice_list[:10], 1):
-                            console.print(f"      {i}. {choice}")
-                        if len(choice_list) > 10:
-                            console.print(f"      ... (+{len(choice_list)-10} more)")
-                        value = console.input(f"    [cyan]Enter value (number or text){' (required)' if required else ' or press Enter to skip'}: [/cyan]")
-
-                        # If they entered a number, use the corresponding choice
-                        try:
-                            choice_idx = int(value) - 1
-                            if 0 <= choice_idx < len(choice_list):
-                                value = choice_list[choice_idx]
-                        except (ValueError, IndexError):
-                            # They entered text directly, use as-is
-                            pass
-                    else:
-                        # No choices found, prompt normally
-                        value = console.input(f"    [cyan]Enter value{' (required)' if required else ' or press Enter to skip'}: [/cyan]")
-                else:
-                    # No choices field, prompt normally
-                    value = console.input(f"    [cyan]Enter value{' (required)' if required else ' or press Enter to skip'}: [/cyan]")
+            # Normalize choices.
+            if isinstance(choices_raw, list):
+                choice_list = [str(c) for c in choices_raw]
+            elif isinstance(choices_raw, str) and choices_raw.strip():
+                choice_list = [s.strip() for s in choices_raw.split(",") if s.strip()]
             else:
-                placeholder = f" ({default})" if default else ""
-                value = console.input(f"    [cyan]Enter value{placeholder}{' (required)' if required else ' or press Enter to skip'}: [/cyan]")
+                choice_list = []
 
-            # Use default if not provided
-            if not value:
-                if default:
-                    value = default
+            if choice_list:
+                console.print("    [cyan]Options:[/cyan]")
+                for i, choice in enumerate(choice_list[:25], 1):
+                    console.print(f"      {i}. {choice}")
+                if len(choice_list) > 25:
+                    console.print(f"      ... (+{len(choice_list) - 25} more)")
+
+            value = console.input(
+                f"    [cyan]Enter value{' (number or text)' if choice_list else ''}{' (required)' if required else ' or press Enter to skip'}: [/cyan]"
+            ).strip()
+
+            # Use default if omitted
+            if value == "":
+                if default not in (None, ""):
+                    value = str(default)
                 elif required:
-                    console.print(f"    [red]This parameter is required![/red]")
+                    console.print("    [red]This parameter is required![/red]")
                     return
                 else:
                     continue
 
-            build_params[param_name] = value
+            # If user provided choice index, resolve to actual choice text.
+            if choice_list:
+                try:
+                    choice_idx = int(value) - 1
+                    if 0 <= choice_idx < len(choice_list):
+                        value = choice_list[choice_idx]
+                except ValueError:
+                    # Text choice typed directly.
+                    pass
 
-        # Create the payload
+            typed_value = _parse_typed_value(value, param_type)
+            build_params[param_name] = typed_value
+
+        # Select and configure C2 profiles for this payload type.
+        c2_profiles_array: List[Dict[str, Any]] = []
+        allowed_c2_names = [
+            entry.get("c2profile", {}).get("name", "")
+            for entry in payload_type.get("payloadtypec2profiles", [])
+            if entry.get("c2profile", {}).get("name")
+        ]
+
+        try:
+            all_c2_profiles = self.client.get_c2_profiles()
+        except MythicAPIException as e:
+            console.print(f"[red]Error fetching C2 profiles:[/red] {str(e)}")
+            return
+
+        if allowed_c2_names:
+            selectable_profiles = [
+                p for p in all_c2_profiles
+                if p.get("name") in allowed_c2_names
+            ]
+        else:
+            selectable_profiles = all_c2_profiles
+
+        if selectable_profiles:
+            console.print("\n[cyan]C2 Profiles:[/cyan]")
+            profile_name_to_obj = {p.get("name", ""): p for p in selectable_profiles if p.get("name")}
+            indexed_profiles = list(profile_name_to_obj.values())
+
+            for i, profile in enumerate(indexed_profiles, 1):
+                running = "[green]running[/green]" if profile.get("running") else "[dim]stopped[/dim]"
+                console.print(f"  {i}. {profile.get('name', '')} ({running})")
+
+            selection_raw = console.input(
+                "[cyan]Select C2 profile(s) (comma-separated number/name, Enter to skip): [/cyan]"
+            ).strip()
+
+            selected_profile_names: List[str] = []
+            if selection_raw:
+                tokens = [token.strip() for token in selection_raw.split(",") if token.strip()]
+                for token in tokens:
+                    selected_name: Optional[str] = None
+                    if token.isdigit():
+                        idx = int(token) - 1
+                        if 0 <= idx < len(indexed_profiles):
+                            selected_name = indexed_profiles[idx].get("name", "")
+                    elif token in profile_name_to_obj:
+                        selected_name = token
+
+                    if not selected_name:
+                        console.print(f"[red]Invalid C2 profile selection: {token}[/red]")
+                        return
+
+                    if selected_name not in selected_profile_names:
+                        selected_profile_names.append(selected_name)
+
+            # Configure selected C2 profiles.
+            for profile_name in selected_profile_names:
+                try:
+                    full_profile = self.client.get_c2_profile_with_parameters(profile_name)
+                except MythicAPIException as e:
+                    console.print(f"[red]Error fetching profile '{profile_name}' details:[/red] {str(e)}")
+                    return
+
+                profile_params: Dict[str, Any] = {}
+                c2_param_defs = full_profile.get("c2profileparameters", [])
+
+                if c2_param_defs:
+                    console.print(f"\n[cyan]Configure C2 profile:[/cyan] {profile_name}")
+
+                for param in c2_param_defs:
+                    param_name = param.get("name", "")
+                    param_type = param.get("parameter_type", "")
+                    description = param.get("description", "")
+                    required = param.get("required", False)
+                    default = param.get("default_value", "")
+                    choices_raw = param.get("choices", [])
+
+                    required_str = "[red](required)[/red]" if required else "[dim](optional)[/dim]"
+                    console.print(f"  {param_name} {required_str}")
+                    if description:
+                        console.print(f"    [dim]{description}[/dim]")
+                    if default not in (None, ""):
+                        console.print(f"    [dim]Default: {default}[/dim]")
+
+                    if isinstance(choices_raw, list):
+                        choice_list = [str(c) for c in choices_raw]
+                    elif isinstance(choices_raw, str) and choices_raw.strip():
+                        choice_list = [s.strip() for s in choices_raw.split(",") if s.strip()]
+                    else:
+                        choice_list = []
+
+                    if choice_list:
+                        console.print("    [cyan]Options:[/cyan]")
+                        for i, choice in enumerate(choice_list[:25], 1):
+                            console.print(f"      {i}. {choice}")
+                        if len(choice_list) > 25:
+                            console.print(f"      ... (+{len(choice_list) - 25} more)")
+
+                    value = console.input(
+                        f"    [cyan]Enter value{' (number or text)' if choice_list else ''}{' (required)' if required else ' or press Enter to skip'}: [/cyan]"
+                    ).strip()
+
+                    if value == "":
+                        if default not in (None, ""):
+                            value = str(default)
+                        elif required:
+                            console.print("    [red]This parameter is required![/red]")
+                            return
+                        else:
+                            continue
+
+                    if choice_list:
+                        try:
+                            choice_idx = int(value) - 1
+                            if 0 <= choice_idx < len(choice_list):
+                                value = choice_list[choice_idx]
+                        except ValueError:
+                            pass
+
+                    profile_params[param_name] = _parse_typed_value(value, param_type)
+
+                c2_profiles_array.append(
+                    {
+                        "c2_profile": profile_name,
+                        "c2_profile_parameters": profile_params,
+                    }
+                )
+
+        # Build final payload definition format expected by createPayload.
+        payload_type_name = payload_type.get("name", payload_type_name or "")
+        file_ext = payload_type.get("file_extension", "")
+        filename = f"{payload_type_name}.{file_ext}" if file_ext else payload_type_name
+
+        payload_config = {
+            "payload_type": payload_type_name,
+            "selected_os": selected_os,
+            "filename": filename,
+            "description": "",
+            "build_parameters": [{"name": k, "value": v} for k, v in build_params.items()],
+            "commands": [],
+            "c2_profiles": c2_profiles_array,
+        }
+
         console.print("\n[cyan]Creating payload...[/cyan]")
 
         try:
-            config = {
-                "payload_type": payload_type_name,
-                "build_parameters": build_params
-            }
-            result = self.client.create_payload(config)
+            result = self.client.create_payload(payload_config)
 
-            # Check if there was an error during build
-            if result.get('status') == 'error':
-                error_msg = result.get('error', 'Unknown error')
-                if 'webhook' in error_msg.lower() or 'json' in error_msg.lower():
-                    console.print(f"[yellow]⚠[/yellow]  Payload created with build error:")
-                    console.print(f"  Error: [red]{error_msg}[/red]")
+            if result.get("status") == "error":
+                error_msg = result.get("error", "Unknown error")
+                if isinstance(error_msg, str) and ("webhook" in error_msg.lower() or "json" in error_msg.lower()):
+                    console.print("[yellow]⚠[/yellow] Payload created with build error:")
+                    console.print(f"  Error: [red]{rich_escape(str(error_msg))}[/red]")
                     console.print(f"  UUID: [cyan]{result.get('uuid', 'Unknown')}[/cyan]")
-                    console.print(f"\n  [dim]The Mythic build webhook may not be properly configured.")
-                    console.print(f"  Check your Mythic server logs for more details.[/dim]")
+                    console.print("\n  [dim]The Mythic payload builder webhook returned an invalid response.")
+                    console.print("  Check payload container logs in Mythic for the underlying stack trace.[/dim]")
                 else:
-                    console.print(f"[red]Build failed:[/red] {error_msg}")
+                    console.print(f"[red]Build failed:[/red] {rich_escape(str(error_msg))}")
             else:
-                console.print(f"[green]✅[/green] Payload created successfully!")
-                console.print(f"  UUID: [cyan]{result.get('uuid', 'Unknown')}[/cyan]")
-                console.print(f"  Status: [green]{result.get('status', 'Unknown')}[/green]")
-                console.print(f"\n  Download with: [yellow]payload-download {result.get('uuid', '')} <filename>[/yellow]")
+                payload_uuid = result.get('uuid', '')
+                console.print(f"[cyan]Submitted to build queue[/cyan] UUID: [yellow]{payload_uuid}[/yellow]")
+                console.print("[cyan]Waiting for build...[/cyan]")
+                
+                # Poll for build status with progress bar
+                import time
+                max_wait = 300  # 5 minutes max
+                poll_interval = 1  # 1 second
+                elapsed = 0
+                
+                with Progress(
+                    *Progress.get_default_columns(),
+                    TimeRemainingColumn(),
+                    console=console,
+                    transient=False
+                ) as progress:
+                    task = progress.add_task(
+                        "[cyan]Building payload[/cyan]",
+                        total=None,  # Indeterminate
+                        visible=True
+                    )
+                    
+                    last_step_status = None
+                    while elapsed < max_wait:
+                        try:
+                            payload_data = self.client.get_payload(payload_uuid)
+                            if not payload_data:
+                                break
+                            
+                            build_phase = payload_data.get("build_phase", "")
+                            build_steps = payload_data.get("payload_build_steps", [])
+                            
+                            # Update progress with current step info
+                            if build_steps:
+                                completed_steps = sum(1 for s in build_steps if s.get("end_time") is not None)
+                                total_steps = len(build_steps)
+                                
+                                if progress.tasks[task].total is None:
+                                    progress.update(task, total=total_steps)
+                                progress.update(task, completed=completed_steps)
+                                
+                                # Find current step
+                                for step in build_steps:
+                                    if step.get("end_time") is None:
+                                        step_name = step.get("step_name", "Unknown")
+                                        if step_name != last_step_status:
+                                            progress.update(
+                                                task,
+                                                description=f"[cyan]Building:[/cyan] {step_name}"
+                                            )
+                                            last_step_status = step_name
+                                        break
+                            
+                            if build_phase == "success":
+                                progress.update(task, description="[green]✓ Build completed[/green]")
+                                progress.stop()
+                                console.print(f"[green]✅[/green] Payload built successfully!")
+                                console.print(f"  UUID: [cyan]{payload_uuid}[/cyan]")
+                                console.print(f"  Status: [green]{build_phase}[/green]")
+                                console.print(f"\n  Download with: [yellow]payload-download {payload_uuid} <filename>[/yellow]")
+                                break
+                            elif build_phase == "error":
+                                progress.update(task, description="[red]✗ Build failed[/red]")
+                                progress.stop()
+                                console.print(f"\n[red]Build failed![/red]")
+                                
+                                error_msg = payload_data.get("build_message", "")
+                                stderr = payload_data.get("build_stderr", "")
+                                
+                                if error_msg:
+                                    console.print(f"  [dim]Message:[/dim] {rich_escape(error_msg[:200])}")
+                                if stderr:
+                                    console.print(f"  [dim]Error:[/dim] {rich_escape(stderr[:200])}")
+                                break
+                        except MythicAPIException:
+                            pass  # Keep polling on error
+                        
+                        time.sleep(poll_interval)
+                        elapsed += poll_interval
+                    
+                    if elapsed >= max_wait:
+                        progress.stop()
+                        console.print("[yellow]⚠ Build timeout (5 minutes) - check status with payload-download[/yellow]")
         except MythicAPIException as e:
-            console.print(f"[red]Error creating payload:[/red] {str(e)}")
+            console.print(f"[red]Error creating payload:[/red] {rich_escape(str(e))}")
 
     def handle_payloads(self, args: List[str]) -> None:
         """List payloads."""
@@ -1805,6 +2105,7 @@ Download a file from Mythic's repository to your local system.
             table = Table(title="Payloads", show_lines=True)
             table.add_column("UUID", style="cyan")
             table.add_column("Type", style="green")
+            table.add_column("Size", style="magenta", justify="right")
             table.add_column("Description", style="yellow")
             table.add_column("Created", style="dim")
 
@@ -1815,9 +2116,14 @@ Download a file from Mythic's repository to your local system.
                     # Format: "2024-01-15T10:30:45.123456+00:00" -> "2024-01-15 10:30"
                     created = created.split("T")[0] + " " + created.split("T")[1][:5] if "T" in created else created[:16]
 
+                filemeta = payload.get("filemetum", {})
+                file_size = filemeta.get("size", 0) if filemeta else 0
+                size_str = f"{file_size:,} B" if file_size else "unknown"
+
                 table.add_row(
                     payload.get("uuid", "")[:16] + "...",
                     payload.get("payloadtype", {}).get("name", ""),
+                    size_str,
                     payload.get("description", ""),
                     created,
                 )

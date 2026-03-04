@@ -1,4 +1,4 @@
-# Mythic-cli
+# Mythic CLI
 A CLI and TUI Tool to interact with the [Mythic C2 Framework](https://github.com/its-a-feature/Mythic).
 
 ## Disclaimer
@@ -34,7 +34,7 @@ pipx install git+https://github.com/Whispergate/Mythic-CLI.git
 ## Usage
 ### Starting the programs
 ```bash
-mythic-cli # Starts the CLI interface
+mythic-term # Starts the CLI interface
 mythic-tui # Starts the TUI interface
 ```
 
@@ -43,6 +43,7 @@ mythic-tui # Starts the TUI interface
 ```bash
 > forge_collections SharpCollection
 > forge_register SharpCollection <Command> (e.g. forge_register SharpCollection Rubeus)
+    > forge_register SharpCollection Rubeus
     > forge_net_Rubeus 
 > forge_download SharpCollection <Command> (e.g. forge_download SharpCollection Rubeus)
 ```

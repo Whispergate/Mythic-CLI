@@ -719,11 +719,62 @@ class MythicClient:
                 build_message
                 build_phase
                 deleted
+                filemetum {
+                    size
+                    sha1
+                }
             }
         }
         """
         result = self._graphql_query(query)
         return result.get("payload", [])
+
+    def get_payload(self, payload_uuid: str) -> Dict[str, Any]:
+        """Get a specific payload with checksum and file size.
+
+        Args:
+            payload_uuid: UUID of the payload.
+
+        Returns:
+            Payload details including file size and SHA1 checksum.
+        """
+        query = """
+        query GetPayload($uuid: String!) {
+            payload(where: {uuid: {_eq: $uuid}}, limit: 1) {
+                id
+                uuid
+                description
+                creation_time
+                payloadtype {
+                    name
+                }
+                os
+                build_message
+                build_stdout
+                build_stderr
+                build_phase
+                deleted
+                filemetum {
+                    size
+                    sha1
+                    md5
+                }
+                payload_build_steps(order_by: {step_number: asc}) {
+                    step_name
+                    step_number
+                    step_success
+                    step_skip
+                    start_time
+                    end_time
+                    step_stdout
+                    step_stderr
+                }
+            }
+        }
+        """
+        result = self._graphql_query(query, {"uuid": payload_uuid})
+        payloads = result.get("payload", [])
+        return payloads[0] if payloads else {}
 
     def get_payload_types(self) -> List[Dict[str, Any]]:
         """Get all available payload types with their build parameters.
@@ -736,6 +787,7 @@ class MythicClient:
             payloadtype(where: {deleted: {_eq: false}}, order_by: {name: asc}) {
                 id
                 name
+                file_extension
                 supported_os
                 buildparameters(order_by: {name: asc}) {
                     id
@@ -771,6 +823,7 @@ class MythicClient:
             payloadtype(where: {name: {_eq: $name}, deleted: {_eq: false}}, limit: 1) {
                 id
                 name
+                file_extension
                 supported_os
                 buildparameters(order_by: {name: asc}) {
                     id
@@ -828,17 +881,58 @@ class MythicClient:
             raise MythicAPIException(f"Failed to create payload: {payload_result.get('error', 'Unknown error')}")
         return payload_result
 
-    def download_payload(self, payload_uuid: str) -> bytes:
-        """Download a payload file.
+    def download_payload(self, payload_uuid: str, verify_checksum: bool = True) -> bytes:
+        """Download a payload file using direct download endpoint.
 
         Args:
             payload_uuid: UUID of the payload to download.
+            verify_checksum: Whether to verify payload checksum (default True).
 
         Returns:
             Payload file contents as bytes.
+            
+        Raises:
+            MythicAPIException: If download fails or checksum verification fails.
         """
-        # Payload downloads may use a different endpoint
-        raise MythicAPIException("Payload download not yet implemented via GraphQL.")
+        import hashlib
+        
+        url = f"{self.base_url}/direct/download/{payload_uuid}"
+        headers = self._get_headers()
+        
+        try:
+            response = self.client.get(url, headers=headers)
+            response.raise_for_status()
+            payload_data = response.content
+            
+            # Verify checksum if enabled
+            if verify_checksum:
+                # Get payload metadata
+                payload_info = self.get_payload(payload_uuid)
+                filemeta = payload_info.get("filemetum", {})
+                
+                if filemeta:
+                    expected_size = filemeta.get("size")
+                    expected_sha1 = filemeta.get("sha1", "")
+                    
+                    # Verify file size
+                    if expected_size is not None and len(payload_data) != expected_size:
+                        raise MythicAPIException(
+                            f"Payload size mismatch: expected {expected_size} bytes, got {len(payload_data)} bytes"
+                        )
+                    
+                    # Verify SHA1 checksum if available
+                    if expected_sha1:
+                        actual_sha1 = hashlib.sha1(payload_data).hexdigest()
+                        if actual_sha1.lower() != expected_sha1.lower():
+                            raise MythicAPIException(
+                                f"Payload SHA1 mismatch: expected {expected_sha1}, got {actual_sha1}"
+                            )
+            
+            return payload_data
+        except httpx.HTTPStatusError as e:
+            raise MythicAPIException(f"Payload download failed: {e.response.status_code} {e.response.reason_phrase}")
+        except Exception as e:
+            raise MythicAPIException(f"Payload download error: {str(e)}")
 
     # Operation management
     def get_operations(self) -> List[Dict[str, Any]]:
@@ -1008,6 +1102,39 @@ class MythicClient:
                 description
                 is_p2p
                 running
+            }
+        }
+        """
+        result = self._graphql_query(query, {"name": profile_name})
+        profiles = result.get("c2profile", [])
+        return profiles[0] if profiles else {}
+
+    def get_c2_profile_with_parameters(self, profile_name: str) -> Dict[str, Any]:
+        """Get a specific C2 profile with its parameters.
+
+        Args:
+            profile_name: Name of the C2 profile.
+
+        Returns:
+            C2 profile data including parameters.
+        """
+        query = """
+        query GetC2ProfileWithParams($name: String!) {
+            c2profile(where: {name: {_eq: $name}}, limit: 1) {
+                id
+                name
+                description
+                is_p2p
+                running
+                c2profileparameters(order_by: {name: asc}) {
+                    id
+                    name
+                    description
+                    required
+                    parameter_type
+                    default_value
+                    choices
+                }
             }
         }
         """
@@ -1189,3 +1316,32 @@ class MythicClient:
     def close(self) -> None:
         """Close the HTTP client."""
         self.client.close()
+
+    def create_payload(self, payload_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new payload.
+        
+        Args:
+            payload_config: Dictionary with payload configuration:
+                - payload_type: str (required)
+                - selected_os: str (required)
+                - filename: str (required)
+                - description: str (optional)
+                - build_parameters: list[dict] with {"name": str, "value": any}
+                - commands: list[str] (empty for all commands)
+                - c2_profiles: list[dict] with {"c2_profile": str, "c2_profile_parameters": dict}
+        
+        Returns:
+            Dictionary with status, error, and uuid fields
+        """
+        import json
+        mutation = """
+        mutation CreatePayload($payload: String!) {
+            createPayload(payloadDefinition: $payload) {
+                status
+                error
+                uuid
+            }
+        }
+        """
+        result = self._graphql_query(mutation, {"payload": json.dumps(payload_config)})
+        return result.get("createPayload", {})

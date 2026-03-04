@@ -44,7 +44,7 @@ dev = [
 ]
 
 [project.scripts]
-mythic-cli = "mythic_cli.main:main"
+mythic-term = "mythic_cli.main:main"
 mythic-tui = "mythic_tui.app:main"
 
 [project.urls]

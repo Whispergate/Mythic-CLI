@@ -232,6 +232,113 @@ def version(ctx):
     console.print(f"Mythic CLI version [cyan]{__version__}[/cyan]")
 
 
+@cli.command(name="list-payload-types")
+@click.pass_context
+def list_payload_types(ctx):
+    """List available payload types."""
+    from .client import MythicClient
+    
+    config_manager = ctx.obj["config_manager"]
+    
+    try:
+        client = MythicClient(config_manager.config)
+        if not client.api_token:
+            console.print("[red]Not logged in. Run 'mythic login' first.[/red]")
+            return
+        
+        payload_types = client.get_payload_types()
+        
+        if not payload_types:
+            console.print("[yellow]No payload types available[/yellow]")
+            return
+        
+        console.print("[bold cyan]Available Payload Types:[/bold cyan]\n")
+        for pt in payload_types:
+            name = pt.get("name", "")
+            supported_os = ", ".join(pt.get("supported_os", []))
+            wrapper = "[yellow](Wrapper)[/yellow]" if pt.get("wrapper") else ""
+            console.print(f"  • [green]{name}[/green] {wrapper}")
+            console.print(f"    OS: {supported_os}")
+            if pt.get("file_extension"):
+                console.print(f"    Extension: .{pt.get('file_extension')}")
+            console.print()
+    except Exception as exc:
+        console.print(f"[red]Failed to list payload types:[/red] {rich_escape(str(exc))}")
+
+
+@cli.command(name="payload-builder")
+@click.pass_context
+def payload_builder(ctx):
+    """Launch the interactive payload builder TUI."""
+    from mythic_tui.payload_builder import PayloadBuilderScreen
+    from mythic_tui.app import MythicTextualApp
+    from .client import MythicClient
+    
+    config_manager = ctx.obj["config_manager"]
+    
+    try:
+        client = MythicClient(config_manager.config)
+        if not client.api_token:
+            console.print("[red]Not logged in. Run 'mythic login' first.[/red]")
+            return
+        
+        # Create a simple app just to run the payload builder
+        from textual.app import App
+        
+        class PayloadBuilderApp(App):
+            def on_mount(self):
+                self.push_screen(PayloadBuilderScreen(client))
+        
+        app = PayloadBuilderApp()
+        app.run()
+    except Exception as exc:
+        console.print(f"[red]Failed to launch payload builder:[/red] {rich_escape(str(exc))}")
+
+
+@cli.command(name="build-payload")
+@click.pass_context
+def build_payload(ctx):
+    """Interactive payload builder (CLI version)."""
+    from .client import MythicClient
+    from .payload_builder import run_payload_builder_click
+    
+    config_manager = ctx.obj["config_manager"]
+    
+    try:
+        client = MythicClient(config_manager.config)
+        if not client.api_token:
+            console.print("[red]Not logged in. Run 'mythic login' first.[/red]")
+            return
+        
+        run_payload_builder_click(client, mode="payload")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled[/yellow]")
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {rich_escape(str(exc))}")
+
+
+@cli.command(name="build-wrapper")
+@click.pass_context
+def build_wrapper(ctx):
+    """Interactive wrapper builder (CLI version)."""
+    from .client import MythicClient
+    from .payload_builder import run_payload_builder_click
+    
+    config_manager = ctx.obj["config_manager"]
+    
+    try:
+        client = MythicClient(config_manager.config)
+        if not client.api_token:
+            console.print("[red]Not logged in. Run 'mythic login' first.[/red]")
+            return
+        
+        run_payload_builder_click(client, mode="wrapper")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled[/yellow]")
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] {rich_escape(str(exc))}")
+
+
 @cli.command(name="completion-install")
 @click.option(
     "--shell",

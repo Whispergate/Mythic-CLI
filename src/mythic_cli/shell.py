@@ -372,18 +372,78 @@ Server: [yellow]{server}[/yellow]
         elif command == "payload-create":
             self.command_handler.handle_payload_create(args)
         elif command == "payload-download":
-            if len(args) < 2:
-                console.print("[red]Usage:[/red] payload-download [uuid] [output_file]")
-            else:
+            # Interactive mode if no arguments provided
+            if len(args) == 0:
+                try:
+                    payloads = self.client.get_payloads()
+                    if not payloads:
+                        console.print("[yellow]No payloads available[/yellow]")
+                        return
+                    
+                    # Filter payloads to only show those with known file size
+                    available_payloads = []
+                    for payload in payloads:
+                        filemeta = payload.get("filemetum", {})
+                        size = filemeta.get("size", 0) if filemeta else 0
+                        if size and size > 0:
+                            available_payloads.append(payload)
+                    
+                    if not available_payloads:
+                        console.print("[yellow]No payloads with known file sizes available[/yellow]")
+                        return
+                    
+                    console.print("\n[bold cyan]Available Payloads:[/bold cyan]")
+                    for i, payload in enumerate(available_payloads, 1):
+                        uuid = payload.get("uuid", "")
+                        ptype = payload.get("payloadtype", {}).get("name", "")
+                        filemeta = payload.get("filemetum", {})
+                        size = filemeta.get("size", 0)
+                        size_str = f"{size:,} B"
+                        desc = payload.get("description", "")[:30]
+                        console.print(f"  {i}. {uuid[:16]}... ({ptype}) - {size_str}")
+                        if desc:
+                            console.print(f"     {desc}")
+                    
+                    choice = console.input("\n[cyan]Select payload (number): [/cyan]").strip()
+                    try:
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(available_payloads):
+                            payload = available_payloads[idx]
+                            uuid = payload.get("uuid", "")
+                            ptype = payload.get("payloadtype", {}).get("name", "")
+                            
+                            output_file = console.input(f"[cyan]Output filename (default: {ptype}.exe): [/cyan]").strip()
+                            if not output_file:
+                                output_file = f"{ptype}.exe"
+                            
+                            console.print(f"\n[cyan]Downloading payload {uuid[:8]}...[/cyan]")
+                            data = self.client.download_payload(uuid, verify_checksum=True)
+                            with open(output_file, "wb") as f:
+                                f.write(data)
+                            console.print(f"[green]✅[/green] Payload verified and saved to {output_file}")
+                            console.print(f"  Size: [cyan]{len(data):,} bytes[/cyan]")
+                        else:
+                            console.print("[red]Invalid selection[/red]")
+                    except ValueError:
+                        console.print("[red]Invalid input[/red]")
+                except Exception as e:
+                    console.print(f"[red]Error:[/red] {str(e)}")
+            # Non-interactive mode with explicit arguments
+            elif len(args) >= 2:
                 try:
                     uuid = args[0]
                     output_file = args[1]
-                    data = self.client.download_payload(uuid)
+                    console.print(f"[cyan]Downloading payload {uuid[:8]}...[/cyan]")
+                    data = self.client.download_payload(uuid, verify_checksum=True)
                     with open(output_file, "wb") as f:
                         f.write(data)
-                    console.print(f"[green]✅[/green] Payload saved to {output_file}")
+                    console.print(f"[green]✅[/green] Payload verified and saved to {output_file}")
+                    console.print(f"  Size: [cyan]{len(data):,} bytes[/cyan]")
                 except Exception as e:
                     console.print(f"[red]Error:[/red] {str(e)}")
+            else:
+                console.print("[red]Usage:[/red] payload-download [uuid] [output_file]")
+                console.print("[dim]Or just 'payload-download' for interactive selection[/dim]")
 
         # Operation commands
         elif command == "operations":

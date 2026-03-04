@@ -22,6 +22,7 @@ from rich.markup import escape as rich_escape
 
 from mythic_cli.client import MythicAPIException, MythicClient
 from mythic_cli.config import ConfigManager
+from mythic_tui.payload_builder import PayloadBuilderScreen
 
 
 def _safe_richlog_write(log: RichLog, text: str) -> None:
@@ -522,7 +523,7 @@ class DashboardScreen(BaseScreen):
             self.app.push_screen(CallbackScreen(actual_id))
             return
         if cmd in {"help", "?"}:
-            self.log_alert("[cyan]Dashboard commands:[/cyan] open <id>, hide/unhide, hidden, clear-hidden, files, login, theme, download-file, upload-file, refresh")
+            self.log_alert("[cyan]Dashboard commands:[/cyan] open <id>, hide/unhide, hidden, clear-hidden, files, payloads, login, theme, download-file, upload-file, refresh")
             return
         if cmd == "theme":
             if not args:
@@ -581,6 +582,9 @@ class DashboardScreen(BaseScreen):
             return
         if cmd == "files":
             self.app.push_screen(FilesScreen())
+            return
+        if cmd in {"payloads", "payload", "builder"}:
+            self.app.push_screen(PayloadBuilderScreen(self._app.client))
             return
         if cmd == "download-file":
             if len(args) < 2:
