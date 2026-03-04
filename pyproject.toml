@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mythic-cli"
+version = "0.1.1"
+description = "A CLI tool for interacting with Mythic C2"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "BSD 2-Clause"}
+authors = [
+    {name = "Whispergate", email = "contact@whispergate.org"}
+]
+keywords = ["mythic", "c2", "cli", "cybersecurity", "red-team"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: BSD 2-Clause",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    "httpx>=0.24.0",
+    "rich>=13.0.0",
+    "click>=8.0.0",
+    "prompt-toolkit>=3.0.0",
+    "textual>=0.71.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "argcomplete>=3.0.0",
+    "pyfiglet>=0.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+mythic-term = "mythic_cli.main:main"
+mythic-tui = "mythic_tui.app:main"
+
+[project.urls]
+Homepage = "https://github.com/Whispergate/Mythic-cli"
+Repository = "https://github.com/Whispergate/Mythic-cli"
+Documentation = "https://github.com/Whispergate/Mythic-cli#readme"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["mythic_cli*", "mythic_tui*"]
+
+[tool.setuptools.package-data]
+mythic_cli = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
