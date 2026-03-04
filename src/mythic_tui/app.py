@@ -642,7 +642,7 @@ class FilesScreen(BaseScreen):
                 yield Static("File Info", id="files-info")
                 yield RichLog(id="files-log", highlight=True, markup=True, auto_scroll=True)
         yield Input(
-            placeholder="Commands: download <row_num> <path>, upload <path>, info <row_num>, refresh, back",
+            placeholder="Commands: download <row_num|uuid> <path>, upload <path>, info <row_num>, refresh, back",
             id="files-input",
         )
         yield Footer()
@@ -671,9 +671,11 @@ class FilesScreen(BaseScreen):
     def _apply_files(self, files: List[Dict[str, Any]]) -> None:
         table = self.query_one("#files-table", DataTable)
         table.clear(columns=False)
-        self._files = files
+        
+        # Filter out files with 0 bytes
+        self._files = [f for f in files if f.get("size", 0) > 0]
 
-        for idx, f in enumerate(files):
+        for idx, f in enumerate(self._files):
             uuid = str(f.get("agent_file_id", ""))
             name = f.get("filename_utf8") or f.get("filename") or f.get("filename_text") or "Unknown"
             size = f.get("size", 0)
@@ -753,7 +755,7 @@ class FilesScreen(BaseScreen):
         
         if cmd == "cli_help":
             self._append_log("[cyan]Files screen commands:[/cyan]")
-            self._append_log("  download <uuid_prefix> <output_path>  Download file")
+            self._append_log("  download <row_num|uuid> <output_path>  Download file")
             self._append_log("  upload <local_path>                    Upload file")
             self._append_log("  info <row_num>                         Show file details")
             self._append_log("  refresh                                Refresh file list")
@@ -762,15 +764,28 @@ class FilesScreen(BaseScreen):
         
         if cmd == "download":
             if len(args) < 2:
-                self._append_log("[yellow]Usage:[/yellow] download <uuid_prefix> <output_path>")
+                self._append_log("[yellow]Usage:[/yellow] download <row_num|uuid_prefix> <output_path>")
                 return
-            partial_uuid, output_path = args[0], args[1]
-            full_uuid = self._app.resolve_partial_uuid(partial_uuid) or partial_uuid
+            identifier, output_path = args[0], args[1]
+            
+            # Try to parse as row number first
+            full_uuid = None
+            try:
+                row_num = int(identifier)
+                if 0 <= row_num < len(self._files):
+                    full_uuid = self._files[row_num].get("agent_file_id", "")
+                else:
+                    self._append_log(f"[red]Invalid row number:[/red] {row_num}")
+                    return
+            except ValueError:
+                # Not a number, treat as UUID prefix
+                full_uuid = self._app.resolve_partial_uuid(identifier) or identifier
+            
             try:
                 data = self._app.client.download_file(full_uuid)
                 with open(output_path, "wb") as fh:
                     fh.write(data)
-                self._append_log(f"[green]✅ Downloaded[/green] {full_uuid} -> {output_path}")
+                self._append_log(f"[green]✅ Downloaded[/green] {full_uuid[:16]}... -> {output_path}")
             except Exception as exc:
                 self._append_log(f"[red]Download failed:[/red] {exc}")
             return

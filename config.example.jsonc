@@ -2,7 +2,7 @@
 # Copy this to ~/.config/mythic-cli/config.json and modify as needed
 
 {
-  "server_url": "http://127.0.0.1:7443",
+  "server_url": "https://127.0.0.1:7443",
   "api_key": null,
   "username": "mythic_admin",
   "password": null,
